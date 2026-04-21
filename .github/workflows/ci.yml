@@ -16,10 +16,10 @@ jobs:
   linux:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
-    - uses: actions/setup-python@v2
+    - uses: actions/checkout@v6
+    - uses: actions/setup-python@v6
       with:
-        python-version: '3.7'
+        python-version: '3.x'
 
     - run: pip install .[tests,lint]
 
@@ -32,10 +32,10 @@ jobs:
     needs: linux
     runs-on: macos-latest
     steps:
-    - uses: actions/checkout@v2
-    - uses: actions/setup-python@v2
+    - uses: actions/checkout@v6
+    - uses: actions/setup-python@v6
       with:
-        python-version: '3.7'
+        python-version: '3.x'
 
     - run: pip install .[tests]
 
@@ -45,10 +45,10 @@ jobs:
     needs: linux
     runs-on: windows-latest
     steps:
-    - uses: actions/checkout@v2
-    - uses: actions/setup-python@v2
+    - uses: actions/checkout@v6
+    - uses: actions/setup-python@v6
       with:
-        python-version: '3.7'
+        python-version: '3.x'
 
     - run: pip install .[tests]
 
