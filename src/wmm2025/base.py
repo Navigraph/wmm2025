@@ -101,7 +101,9 @@ def _init() -> None:
     if not COF_PATH.is_file():
         raise FileNotFoundError(f"WMM coefficient file not found: {COF_PATH}")
     with _lock:
-        ret = libwmm.wmm_init(str(COF_PATH).encode("utf-8"))
+        # fsencode, not UTF-8: an install path can hold bytes that decoded to
+        # surrogates, which UTF-8 refuses to encode back.
+        ret = libwmm.wmm_init(os.fsencode(COF_PATH))
     _require_ok(ret, "wmm_init")
 
 
@@ -173,9 +175,10 @@ def wmm(glats: np.ndarray, glons: np.ndarray, alt_km: float, yeardec: float) -> 
         raise ValueError(f"glats shape {glats.shape} != glons shape {glons.shape}")
 
     # Only the row/column vectors matter: the C side evaluates the outer product
-    # and reuses the Legendre functions across each latitude row.
-    lat_axis = np.ascontiguousarray(glats[:, 0], dtype=np.float64)
-    lon_axis = np.ascontiguousarray(glons[0, :], dtype=np.float64)
+    # and reuses the Legendre functions across each latitude row. Slice instead
+    # of indexing so an empty grid stays empty rather than raising IndexError.
+    lat_axis = np.ascontiguousarray(glats[:, :1].ravel(), dtype=np.float64)
+    lon_axis = np.ascontiguousarray(glons[:1, :].ravel(), dtype=np.float64)
     nlat = _c_int_size(lat_axis.size, "number of latitudes")
     nlon = _c_int_size(lon_axis.size, "number of longitudes")
     north, east, down, total, decl, incl = _out_ptrs(nlat * nlon)
@@ -225,7 +228,9 @@ def transect(glats: np.ndarray, glons: np.ndarray, alt_km: np.ndarray, yeardec: 
         "alt_km": np.asarray(alt_km),
         "yeardec": np.asarray(yeardec),
     }
-    szs = {k: v.shape for k, v in inputs.items() if v.size > 1}
+    # Anything that is not a single held-constant value defines the common
+    # shape, an empty array included: that just yields an empty transect.
+    szs = {k: v.shape for k, v in inputs.items() if v.size != 1}
 
     if len(szs) > 1:
         shapes = list(szs.values())
@@ -233,13 +238,13 @@ def transect(glats: np.ndarray, glons: np.ndarray, alt_km: np.ndarray, yeardec: 
             raise ValueError(f"incompatible input shapes: {szs}")
         sz = shapes[0]
     elif len(szs) == 1:
-        sz = list(szs.values())[0]
+        sz = next(iter(szs.values()))
     else:
         sz = ()
 
     # Broadcast the held-constant inputs to the common shape.
     flat = {
-        k: _as_f64_1d(v if v.size > 1 else np.full(sz, v.flat[0] if v.size else v))
+        k: _as_f64_1d(v if v.size != 1 else np.full(sz, v.flat[0]))
         for k, v in inputs.items()
     }
     n = _c_int_size(flat["glats"].size, "number of points")
