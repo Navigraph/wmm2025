@@ -1,5 +1,5 @@
 from pytest import approx
-import xarray
+import numpy as np
 
 import wmm2025 as wmm
 
@@ -14,15 +14,17 @@ import wmm2025 as wmm
 def test_wmm2025():
     mag = wmm.wmm(43, 93, alt_km=65, yeardec=2025.0)
 
-    assert isinstance(mag, xarray.Dataset)
+    assert isinstance(mag, dict)
+    assert isinstance(mag["north"], np.ndarray)
 
-    assert mag.north.item() == approx(24299.85307628114)
-    assert mag.east.item() == approx(210.51706617299905)
-    assert mag.down.item() == approx(50037.923996804515)
-    assert mag.total.item() == approx(55626.621458380745)
+    assert mag["north"].item() == approx(24299.85307628114)
+    assert mag["east"].item() == approx(210.51706617299905)
+    assert mag["down"].item() == approx(50037.923996804515)
+    assert mag["total"].item() == approx(55626.621458380745)
 
-    assert mag.incl.item() == approx(64.09661390135923)
-    assert mag.decl.item() == approx(0.4963584605572848)
+    assert mag["incl"].item() == approx(64.09661390135923)
+    assert mag["decl"].item() == approx(0.4963584605572848)
+    assert mag["time"] == 2025.0
 
 
 def test_wmm2025_point():

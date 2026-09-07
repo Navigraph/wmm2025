@@ -2,6 +2,11 @@ cmake_minimum_required(VERSION 3.14...3.21)
 
 project(wmm20 LANGUAGES C)
 
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3")
+
 include(CTest)
 
 include(CheckSymbolExists)
