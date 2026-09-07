@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import atexit
 import ctypes as ct
+import os
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -43,20 +45,8 @@ libwmm.wmm_eval.argtypes = [
 ]
 libwmm.wmm_eval.restype = ct.c_int
 
-libwmm.wmm_eval_grid.argtypes = [
-    _c_double_p,
-    _c_double_p,
-    ct.c_int,
-    ct.c_double,
-    ct.c_double,
-    _c_double_p,
-    _c_double_p,
-    _c_double_p,
-    _c_double_p,
-    _c_double_p,
-    _c_double_p,
-]
-libwmm.wmm_eval_grid.restype = ct.c_int
+# wmm_eval_grid() exists in the C library for scattered points but has no Python
+# binding; anything added here must route its count through _c_int_size().
 
 libwmm.wmm_eval_latlon_grid.argtypes = [
     _c_double_p,
@@ -90,6 +80,18 @@ libwmm.wmm_eval_many.argtypes = [
 libwmm.wmm_eval_many.restype = ct.c_int
 
 
+# The C layer holds the model coefficients and the Legendre / spherical-harmonic
+# scratch buffers in one process-global struct, and ctypes drops the GIL for the
+# duration of each call. Serialize every entry point so that concurrent calls
+# from Python threads cannot interleave on that shared state. Callers who want
+# real parallelism should use separate processes, which get their own copy.
+_lock = threading.Lock()
+
+if hasattr(os, "register_at_fork"):
+    # A child forked while another thread held the lock would inherit it locked.
+    os.register_at_fork(after_in_child=lambda: globals().__setitem__("_lock", threading.Lock()))
+
+
 def _require_ok(ret: int, what: str) -> None:
     if ret != 0:
         raise RuntimeError(f"{what} failed (code {ret})")
@@ -98,11 +100,18 @@ def _require_ok(ret: int, what: str) -> None:
 def _init() -> None:
     if not COF_PATH.is_file():
         raise FileNotFoundError(f"WMM coefficient file not found: {COF_PATH}")
-    _require_ok(libwmm.wmm_init(str(COF_PATH).encode("utf-8")), "wmm_init")
+    with _lock:
+        ret = libwmm.wmm_init(str(COF_PATH).encode("utf-8"))
+    _require_ok(ret, "wmm_init")
+
+
+def _shutdown() -> None:
+    with _lock:
+        libwmm.wmm_free()
 
 
 _init()
-atexit.register(libwmm.wmm_free)
+atexit.register(_shutdown)
 
 
 def _as_f64_1d(a: np.ndarray) -> np.ndarray:
@@ -121,6 +130,24 @@ def _out_ptrs(n: int):
 
 def _cptr(a: np.ndarray):
     return a.ctypes.data_as(_c_double_p)
+
+
+_C_INT_MAX = 2**31 - 1
+
+
+def _c_int_size(value: int, name: str) -> int:
+    """
+    Validate a count that crosses into the C API as ``int``.
+
+    ctypes truncates silently rather than raising, so an oversized count would
+    reach C as a smaller (or negative) number and quietly produce partial
+    output. The C side indexes the outer product with ``size_t``, so only the
+    individual axis lengths are bounded, not their product.
+    """
+    value = int(value)
+    if not 0 <= value <= _C_INT_MAX:
+        raise ValueError(f"{name} must be between 0 and {_C_INT_MAX}, got {value}")
+    return value
 
 
 def wmm(glats: np.ndarray, glons: np.ndarray, alt_km: float, yeardec: float) -> dict:
@@ -149,12 +176,12 @@ def wmm(glats: np.ndarray, glons: np.ndarray, alt_km: float, yeardec: float) -> 
     # and reuses the Legendre functions across each latitude row.
     lat_axis = np.ascontiguousarray(glats[:, 0], dtype=np.float64)
     lon_axis = np.ascontiguousarray(glons[0, :], dtype=np.float64)
-    nlat = lat_axis.size
-    nlon = lon_axis.size
+    nlat = _c_int_size(lat_axis.size, "number of latitudes")
+    nlon = _c_int_size(lon_axis.size, "number of longitudes")
     north, east, down, total, decl, incl = _out_ptrs(nlat * nlon)
 
-    _require_ok(
-        libwmm.wmm_eval_latlon_grid(
+    with _lock:
+        ret = libwmm.wmm_eval_latlon_grid(
             _cptr(lat_axis),
             nlat,
             _cptr(lon_axis),
@@ -167,9 +194,8 @@ def wmm(glats: np.ndarray, glons: np.ndarray, alt_km: float, yeardec: float) -> 
             _cptr(total),
             _cptr(decl),
             _cptr(incl),
-        ),
-        "wmm_eval_latlon_grid",
-    )
+        )
+    _require_ok(ret, "wmm_eval_latlon_grid")
 
     shape = glats.shape
     return {
@@ -193,7 +219,12 @@ def transect(glats: np.ndarray, glons: np.ndarray, alt_km: np.ndarray, yeardec: 
     of the same size.
     """
 
-    inputs = {k: np.asarray(v) for k, v in vars().items()}
+    inputs = {
+        "glats": np.asarray(glats),
+        "glons": np.asarray(glons),
+        "alt_km": np.asarray(alt_km),
+        "yeardec": np.asarray(yeardec),
+    }
     szs = {k: v.shape for k, v in inputs.items() if v.size > 1}
 
     if len(szs) > 1:
@@ -206,14 +237,16 @@ def transect(glats: np.ndarray, glons: np.ndarray, alt_km: np.ndarray, yeardec: 
     else:
         sz = ()
 
-    ref_input = {k: v if v.size > 1 else np.full(sz, v.item() if v.shape == () else v.flat[0]) for k, v in inputs.items()}
-
-    flat = {k: _as_f64_1d(v) for k, v in ref_input.items()}
-    n = flat["glats"].size
+    # Broadcast the held-constant inputs to the common shape.
+    flat = {
+        k: _as_f64_1d(v if v.size > 1 else np.full(sz, v.flat[0] if v.size else v))
+        for k, v in inputs.items()
+    }
+    n = _c_int_size(flat["glats"].size, "number of points")
     north, east, down, total, decl, incl = _out_ptrs(n)
 
-    _require_ok(
-        libwmm.wmm_eval_many(
+    with _lock:
+        ret = libwmm.wmm_eval_many(
             _cptr(flat["glats"]),
             _cptr(flat["glons"]),
             _cptr(flat["alt_km"]),
@@ -225,9 +258,8 @@ def transect(glats: np.ndarray, glons: np.ndarray, alt_km: np.ndarray, yeardec: 
             _cptr(total),
             _cptr(decl),
             _cptr(incl),
-        ),
-        "wmm_eval_many",
-    )
+        )
+    _require_ok(ret, "wmm_eval_many")
 
     if sz == ():
         return {
@@ -266,8 +298,8 @@ def wmm_point(glat: float, glon: float, alt_km: float, yeardec: float) -> dict[s
     D = ct.c_double()
     mI = ct.c_double()
 
-    _require_ok(
-        libwmm.wmm_eval(
+    with _lock:
+        ret = libwmm.wmm_eval(
             glat,
             glon,
             alt_km,
@@ -278,9 +310,8 @@ def wmm_point(glat: float, glon: float, alt_km: float, yeardec: float) -> dict[s
             ct.byref(T),
             ct.byref(D),
             ct.byref(mI),
-        ),
-        "wmm_eval",
-    )
+        )
+    _require_ok(ret, "wmm_eval")
 
     return {
         "glat": glat,

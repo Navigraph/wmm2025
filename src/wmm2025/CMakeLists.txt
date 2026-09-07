@@ -2,10 +2,12 @@ cmake_minimum_required(VERSION 3.14...3.21)
 
 project(wmm20 LANGUAGES C)
 
+# Without this the build-on-run path configures with an empty build type, i.e.
+# unoptimized. FORCE is required because CMake already caches it as empty.
+# The per-compiler Release defaults optimize (-O3 on GCC/Clang, /O2 on MSVC).
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
-set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3")
 
 include(CTest)
 

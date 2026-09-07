@@ -16,6 +16,11 @@
 #include "GeomagnetismHeader.h"
 #include "EGM9615.h"
 
+/*
+ * NOT thread-safe: the scratch buffers below are mutated by every evaluation,
+ * so callers must serialize entry points (the Python wrapper holds a lock) or
+ * use one process per thread of execution.
+ */
 typedef struct {
     int ready;
     int nMax;

@@ -36,18 +36,23 @@ def build():
     subprocess.check_call([exe, "--build", str(b), "--parallel"])
 
 
+def compile_inputs() -> list[Path]:
+    """
+    Every file that can change the built library.
+
+    Discovered rather than listed, so that adding a source or header cannot
+    silently leave users on stale native code.
+    """
+    s = package_src_dir()
+    return [s / "CMakeLists.txt", *sorted((s / "src").rglob("*.c")),
+            *sorted((s / "src").rglob("*.h"))]
+
+
 def needs_rebuild(dllfn: Path) -> bool:
     if not dllfn.is_file():
         return True
-    s = package_src_dir()
-    sources = [
-        s / "CMakeLists.txt",
-        s / "src" / "wmm_point_sub.c",
-        s / "src" / "GeomagnetismLibrary.c",
-        s / "src" / "GeomagnetismHeader.h",
-    ]
     dll_mtime = dllfn.stat().st_mtime
-    return any(src.is_file() and src.stat().st_mtime > dll_mtime for src in sources)
+    return any(f.stat().st_mtime > dll_mtime for f in compile_inputs() if f.is_file())
 
 
 def get_libpath(bin_dir: Path, stem: str) -> Path:
