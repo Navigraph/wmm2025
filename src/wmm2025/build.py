@@ -13,6 +13,11 @@ import sys
 import os
 
 
+def package_src_dir() -> Path:
+    with importlib.resources.path(__package__, "CMakeLists.txt") as f:
+        return f.parent
+
+
 def build():
     """
     attempt to build using CMake
@@ -22,14 +27,32 @@ def build():
     if not exe:
         raise FileNotFoundError("CMake not available")
 
-    with importlib.resources.path(__package__, "CMakeLists.txt") as f:
-        s = f.parent
-        b = s / "build"
-        g = []
-        if sys.platform == "win32" and not os.environ.get("CMAKE_GENERATOR"):
-            g = ["-G", "MinGW Makefiles"]
-        subprocess.check_call([exe, f"-S{s}", f"-B{b}"] + g)
-        subprocess.check_call([exe, "--build", str(b), "--parallel"])
+    s = package_src_dir()
+    b = s / "build"
+    g = []
+    if sys.platform == "win32" and not os.environ.get("CMAKE_GENERATOR"):
+        g = ["-G", "MinGW Makefiles"]
+    subprocess.check_call([exe, f"-S{s}", f"-B{b}"] + g)
+    subprocess.check_call([exe, "--build", str(b), "--parallel"])
+
+
+def compile_inputs() -> list[Path]:
+    """
+    Every file that can change the built library.
+
+    Discovered rather than listed, so that adding a source or header cannot
+    silently leave users on stale native code.
+    """
+    s = package_src_dir()
+    return [s / "CMakeLists.txt", *sorted((s / "src").rglob("*.c")),
+            *sorted((s / "src").rglob("*.h"))]
+
+
+def needs_rebuild(dllfn: Path) -> bool:
+    if not dllfn.is_file():
+        return True
+    dll_mtime = dllfn.stat().st_mtime
+    return any(f.stat().st_mtime > dll_mtime for f in compile_inputs() if f.is_file())
 
 
 def get_libpath(bin_dir: Path, stem: str) -> Path:

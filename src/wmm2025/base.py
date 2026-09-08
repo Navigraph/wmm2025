@@ -1,100 +1,217 @@
 from __future__ import annotations
-import numpy as np
-from pathlib import Path
-import xarray
+
+import atexit
 import ctypes as ct
 import os
+import threading
+from pathlib import Path
 
-from .build import build, get_libpath
+import numpy as np
+
+from .build import build, get_libpath, needs_rebuild
 
 SDIR = Path(__file__).parent
 BDIR = SDIR / "build"
+COF_PATH = SDIR / "WMM.COF"
 
-# NOTE: must be str() for Windows, even with py37
 dllfn = get_libpath(BDIR, "wmm20")
-if not dllfn.is_file():
+if needs_rebuild(dllfn):
     build()
     dllfn = get_libpath(BDIR, "wmm20")
     if not dllfn.is_file():
         raise ModuleNotFoundError(f"could not find {dllfn}")
 
-libwmm = ct.cdll.LoadLibrary(str(dllfn))
+libwmm = ct.CDLL(str(dllfn))
+
+_c_double_p = ct.POINTER(ct.c_double)
+
+libwmm.wmm_init.argtypes = [ct.c_char_p]
+libwmm.wmm_init.restype = ct.c_int
+
+libwmm.wmm_free.argtypes = []
+libwmm.wmm_free.restype = None
+
+libwmm.wmm_eval.argtypes = [
+    ct.c_double,
+    ct.c_double,
+    ct.c_double,
+    ct.c_double,
+    _c_double_p,
+    _c_double_p,
+    _c_double_p,
+    _c_double_p,
+    _c_double_p,
+    _c_double_p,
+]
+libwmm.wmm_eval.restype = ct.c_int
+
+# wmm_eval_grid() exists in the C library for scattered points but has no Python
+# binding; anything added here must route its count through _c_int_size().
+
+libwmm.wmm_eval_latlon_grid.argtypes = [
+    _c_double_p,
+    ct.c_int,
+    _c_double_p,
+    ct.c_int,
+    ct.c_double,
+    ct.c_double,
+    _c_double_p,
+    _c_double_p,
+    _c_double_p,
+    _c_double_p,
+    _c_double_p,
+    _c_double_p,
+]
+libwmm.wmm_eval_latlon_grid.restype = ct.c_int
+
+libwmm.wmm_eval_many.argtypes = [
+    _c_double_p,
+    _c_double_p,
+    _c_double_p,
+    _c_double_p,
+    ct.c_int,
+    _c_double_p,
+    _c_double_p,
+    _c_double_p,
+    _c_double_p,
+    _c_double_p,
+    _c_double_p,
+]
+libwmm.wmm_eval_many.restype = ct.c_int
 
 
-def wmm(glats: np.ndarray, glons: np.ndarray, alt_km: float, yeardec: float) -> xarray.Dataset:
+# The C layer holds the model coefficients and the Legendre / spherical-harmonic
+# scratch buffers in one process-global struct, and ctypes drops the GIL for the
+# duration of each call. Serialize every entry point so that concurrent calls
+# from Python threads cannot interleave on that shared state. Callers who want
+# real parallelism should use separate processes, which get their own copy.
+_lock = threading.Lock()
+
+if hasattr(os, "register_at_fork"):
+    # A child forked while another thread held the lock would inherit it locked.
+    os.register_at_fork(after_in_child=lambda: globals().__setitem__("_lock", threading.Lock()))
+
+
+def _require_ok(ret: int, what: str) -> None:
+    if ret != 0:
+        raise RuntimeError(f"{what} failed (code {ret})")
+
+
+def _init() -> None:
+    if not COF_PATH.is_file():
+        raise FileNotFoundError(f"WMM coefficient file not found: {COF_PATH}")
+    with _lock:
+        # fsencode, not UTF-8: an install path can hold bytes that decoded to
+        # surrogates, which UTF-8 refuses to encode back.
+        ret = libwmm.wmm_init(os.fsencode(COF_PATH))
+    _require_ok(ret, "wmm_init")
+
+
+def _shutdown() -> None:
+    with _lock:
+        libwmm.wmm_free()
+
+
+_init()
+atexit.register(_shutdown)
+
+
+def _as_f64_1d(a: np.ndarray) -> np.ndarray:
+    return np.ascontiguousarray(a, dtype=np.float64).reshape(-1)
+
+
+def _out_ptrs(n: int):
+    north = np.empty(n, dtype=np.float64)
+    east = np.empty(n, dtype=np.float64)
+    down = np.empty(n, dtype=np.float64)
+    total = np.empty(n, dtype=np.float64)
+    decl = np.empty(n, dtype=np.float64)
+    incl = np.empty(n, dtype=np.float64)
+    return north, east, down, total, decl, incl
+
+
+def _cptr(a: np.ndarray):
+    return a.ctypes.data_as(_c_double_p)
+
+
+_C_INT_MAX = 2**31 - 1
+
+
+def _c_int_size(value: int, name: str) -> int:
+    """
+    Validate a count that crosses into the C API as ``int``.
+
+    ctypes truncates silently rather than raising, so an oversized count would
+    reach C as a smaller (or negative) number and quietly produce partial
+    output. The C side indexes the outer product with ``size_t``, so only the
+    individual axis lengths are bounded, not their product.
+    """
+    value = int(value)
+    if not 0 <= value <= _C_INT_MAX:
+        raise ValueError(f"{name} must be between 0 and {_C_INT_MAX}, got {value}")
+    return value
+
+
+def wmm(glats: np.ndarray, glons: np.ndarray, alt_km: float, yeardec: float) -> dict:
     """
     wmm computes the value of the world magnetic model at grid points specified by glats and
     glons, for a single altitude value. glats and glons should be in degrees.
 
     glats and glons should be generated from something like np.meshgrid, so they should be
     2-D arrays.
+
+    Returns a dict of numpy arrays: glat/glon (1-D), field components (2-D), and time.
     """
 
-    glats = np.atleast_2d(glats).astype(np.float64)  # to coerce all else to float64
-    glons = np.atleast_2d(glons).astype(np.float64)
+    glats = np.atleast_2d(np.ascontiguousarray(glats, dtype=np.float64))
+    glons = np.atleast_2d(np.ascontiguousarray(glons, dtype=np.float64))
 
-    # the only way to check, if two 1-D arrays are passed in is to examine the values.
-    # expect that lon[:,i] for all i are the same value
-    # expect that lat[i,:] for all i are the same value
-    assert np.allclose(np.diff(glons, axis=0), 0)
-    assert np.allclose(np.diff(glats, axis=1), 0)
+    # expect lon[:,i] constant and lat[i,:] constant (meshgrid layout)
+    if glats.shape[0] > 1 and not np.allclose(np.diff(glons, axis=0), 0):
+        raise ValueError("glons must be constant along axis 0 (meshgrid layout)")
+    if glats.shape[1] > 1 and not np.allclose(np.diff(glats, axis=1), 0):
+        raise ValueError("glats must be constant along axis 1 (meshgrid layout)")
+    if glats.shape != glons.shape:
+        raise ValueError(f"glats shape {glats.shape} != glons shape {glons.shape}")
 
-    assert glats.shape == glons.shape
+    # Only the row/column vectors matter: the C side evaluates the outer product
+    # and reuses the Legendre functions across each latitude row. Slice instead
+    # of indexing so an empty grid stays empty rather than raising IndexError.
+    lat_axis = np.ascontiguousarray(glats[:, :1].ravel(), dtype=np.float64)
+    lon_axis = np.ascontiguousarray(glons[:1, :].ravel(), dtype=np.float64)
+    nlat = _c_int_size(lat_axis.size, "number of latitudes")
+    nlon = _c_int_size(lon_axis.size, "number of longitudes")
+    north, east, down, total, decl, incl = _out_ptrs(nlat * nlon)
 
-    mag = xarray.Dataset(coords={"glat": glats[:, 0], "glon": glons[0, :]})
-    north = np.empty(glats.size)
-    east = np.empty(glats.size)
-    down = np.empty(glats.size)
-    total = np.empty(glats.size)
-    decl = np.empty(glats.size)
-    incl = np.empty(glats.size)
-
-    for i, (glat, glon) in enumerate(zip(glats.ravel(), glons.ravel())):
-
-        x = ct.c_double()
-        y = ct.c_double()
-        z = ct.c_double()
-        T = ct.c_double()
-        D = ct.c_double()
-        mI = ct.c_double()
-
-        # this hack is needed because of coding practice of WMM
-
-        old_dir = os.getcwd()
-        os.chdir(SDIR)
-        ret = libwmm.wmmsub(
-            ct.c_double(glat),
-            ct.c_double(glon),
-            ct.c_double(alt_km),
-            ct.c_double(yeardec),
-            ct.byref(x),
-            ct.byref(y),
-            ct.byref(z),
-            ct.byref(T),
-            ct.byref(D),
-            ct.byref(mI),
+    with _lock:
+        ret = libwmm.wmm_eval_latlon_grid(
+            _cptr(lat_axis),
+            nlat,
+            _cptr(lon_axis),
+            nlon,
+            float(alt_km),
+            float(yeardec),
+            _cptr(north),
+            _cptr(east),
+            _cptr(down),
+            _cptr(total),
+            _cptr(decl),
+            _cptr(incl),
         )
-        os.chdir(old_dir)
+    _require_ok(ret, "wmm_eval_latlon_grid")
 
-        assert ret == 0
-
-        north[i] = x.value
-        east[i] = y.value
-        down[i] = z.value
-        total[i] = T.value
-        decl[i] = D.value
-        incl[i] = mI.value
-
-    mag["north"] = (("glat", "glon"), north.reshape(glats.shape))
-    mag["east"] = (("glat", "glon"), east.reshape(glats.shape))
-    mag["down"] = (("glat", "glon"), down.reshape(glats.shape))
-    mag["total"] = (("glat", "glon"), total.reshape(glats.shape))
-    mag["incl"] = (("glat", "glon"), incl.reshape(glats.shape))
-    mag["decl"] = (("glat", "glon"), decl.reshape(glats.shape))
-
-    mag.attrs["time"] = yeardec
-
-    return mag
+    shape = glats.shape
+    return {
+        "glat": lat_axis,
+        "glon": lon_axis,
+        "north": north.reshape(shape),
+        "east": east.reshape(shape),
+        "down": down.reshape(shape),
+        "total": total.reshape(shape),
+        "incl": incl.reshape(shape),
+        "decl": decl.reshape(shape),
+        "time": float(yeardec),
+    }
 
 
 def transect(glats: np.ndarray, glons: np.ndarray, alt_km: np.ndarray, yeardec: np.ndarray) -> dict:
@@ -105,103 +222,79 @@ def transect(glats: np.ndarray, glons: np.ndarray, alt_km: np.ndarray, yeardec: 
     of the same size.
     """
 
-    # get all the inputs in a dictionary and convert to numpy arrays
-    inputs = {k: np.asarray(v) for k, v in vars().items()}
+    inputs = {
+        "glats": np.asarray(glats),
+        "glons": np.asarray(glons),
+        "alt_km": np.asarray(alt_km),
+        "yeardec": np.asarray(yeardec),
+    }
+    # Anything that is not a single held-constant value defines the common
+    # shape, an empty array included: that just yields an empty transect.
+    szs = {k: v.shape for k, v in inputs.items() if v.size != 1}
 
-    # get the shape of each input element that is not one element
-    szs = {k: v.shape for k, v in inputs.items() if v.size > 1}
-
-    # check if each in sz ar the same shape, if they all have the same size, this
-    # will be true.
-    # this will raise a TypeError if the number of dimensions are different
-    # this will raise an AssertionError if the dimensions are the same, but the shapes are different
-    assert np.allclose(np.diff(np.asarray([v for v in szs.values()]), axis=0), 0)
-
-    # since they are the same, pick the first and save
-    if len(szs) > 0:
-        sz = list(szs.values())[0]
+    if len(szs) > 1:
+        shapes = list(szs.values())
+        if any(s != shapes[0] for s in shapes[1:]):
+            raise ValueError(f"incompatible input shapes: {szs}")
+        sz = shapes[0]
+    elif len(szs) == 1:
+        sz = next(iter(szs.values()))
     else:
-        # if all inputs are single value, we end up here
         sz = ()
 
-    # reformat the inputs to have all the same shape
-    ref_input = {k: v if v.size > 1 else np.ones(sz) * v for k, v in inputs.items()}
-
-    # create output arrays
-    north = np.empty(sz)
-    east = np.empty(sz)
-    down = np.empty(sz)
-    total = np.empty(sz)
-    decl = np.empty(sz)
-    incl = np.empty(sz)
-
-    for i, (_lat, _lon, _alt, _year) in enumerate(zip(*[v.ravel() for v in ref_input.values()])):
-
-        x = ct.c_double()
-        y = ct.c_double()
-        z = ct.c_double()
-        T = ct.c_double()
-        D = ct.c_double()
-        mI = ct.c_double()
-
-        # this hack is needed because of coding practice of WMM
-
-        old_dir = os.getcwd()
-        os.chdir(SDIR)
-        ret = libwmm.wmmsub(
-            ct.c_double(_lat),
-            ct.c_double(_lon),
-            ct.c_double(_alt),
-            ct.c_double(_year),
-            ct.byref(x),
-            ct.byref(y),
-            ct.byref(z),
-            ct.byref(T),
-            ct.byref(D),
-            ct.byref(mI),
-        )
-        os.chdir(old_dir)
-
-        assert ret == 0
-
-        north[i] = x.value
-        east[i] = y.value
-        down[i] = z.value
-        total[i] = T.value
-        decl[i] = D.value
-        incl[i] = mI.value
-
-    rd = {
-        "north": north[()],
-        "east": east[()],
-        "down": down[()],
-        "total": total[()],
-        "decl": decl[()],
-        "incl": incl[()],
+    # Broadcast the held-constant inputs to the common shape.
+    flat = {
+        k: _as_f64_1d(v if v.size != 1 else np.full(sz, v.flat[0]))
+        for k, v in inputs.items()
     }
+    n = _c_int_size(flat["glats"].size, "number of points")
+    north, east, down, total, decl, incl = _out_ptrs(n)
 
-    return rd
+    with _lock:
+        ret = libwmm.wmm_eval_many(
+            _cptr(flat["glats"]),
+            _cptr(flat["glons"]),
+            _cptr(flat["alt_km"]),
+            _cptr(flat["yeardec"]),
+            n,
+            _cptr(north),
+            _cptr(east),
+            _cptr(down),
+            _cptr(total),
+            _cptr(decl),
+            _cptr(incl),
+        )
+    _require_ok(ret, "wmm_eval_many")
+
+    if sz == ():
+        return {
+            "north": north.item(),
+            "east": east.item(),
+            "down": down.item(),
+            "total": total.item(),
+            "decl": decl.item(),
+            "incl": incl.item(),
+        }
+
+    return {
+        "north": north.reshape(sz),
+        "east": east.reshape(sz),
+        "down": down.reshape(sz),
+        "total": total.reshape(sz),
+        "decl": decl.reshape(sz),
+        "incl": incl.reshape(sz),
+    }
 
 
 def wmm_point(glat: float, glon: float, alt_km: float, yeardec: float) -> dict[str, float]:
     """
-    wmm_unique computes the value of the world magnetic model at a specific unique points specified by glat,
-    glon, and a altitude value. glat and glon should be in degrees.
-
-    It is meant to be faster than `wmm` and `transect` to retrieve one single value.
+    wmm_point computes the value of the world magnetic model at a specific point.
     """
 
-    if isinstance(glat, int):
-        glat = float(glat)
-    if isinstance(glon, int):
-        glon = float(glon)
-    if isinstance(alt_km, int):
-        alt_km = float(alt_km)
-
-    assert isinstance(glat, float)
-    assert isinstance(glon, float)
-
-    mag = {"glat": glat, "glon": glon}
+    glat = float(glat)
+    glon = float(glon)
+    alt_km = float(alt_km)
+    yeardec = float(yeardec)
 
     x = ct.c_double()
     y = ct.c_double()
@@ -210,33 +303,29 @@ def wmm_point(glat: float, glon: float, alt_km: float, yeardec: float) -> dict[s
     D = ct.c_double()
     mI = ct.c_double()
 
-    # this hack is needed because of coding practice of WMM
+    with _lock:
+        ret = libwmm.wmm_eval(
+            glat,
+            glon,
+            alt_km,
+            yeardec,
+            ct.byref(x),
+            ct.byref(y),
+            ct.byref(z),
+            ct.byref(T),
+            ct.byref(D),
+            ct.byref(mI),
+        )
+    _require_ok(ret, "wmm_eval")
 
-    old_dir = os.getcwd()
-    os.chdir(SDIR)
-    ret = libwmm.wmmsub(
-        ct.c_double(glat),
-        ct.c_double(glon),
-        ct.c_double(alt_km),
-        ct.c_double(yeardec),
-        ct.byref(x),
-        ct.byref(y),
-        ct.byref(z),
-        ct.byref(T),
-        ct.byref(D),
-        ct.byref(mI),
-    )
-    os.chdir(old_dir)
-
-    assert ret == 0
-
-    mag["north"] = x.value
-    mag["east"] = y.value
-    mag["down"] = z.value
-    mag["total"] = T.value
-    mag["incl"] = mI.value
-    mag["decl"] = D.value
-
-    mag["time"] = yeardec
-
-    return mag
+    return {
+        "glat": glat,
+        "glon": glon,
+        "north": x.value,
+        "east": y.value,
+        "down": z.value,
+        "total": T.value,
+        "incl": mI.value,
+        "decl": D.value,
+        "time": yeardec,
+    }
