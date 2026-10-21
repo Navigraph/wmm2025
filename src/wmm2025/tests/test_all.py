@@ -76,3 +76,55 @@ def test_concurrent_calls_do_not_interfere():
         t.join()
 
     assert not mismatches
+
+
+def test_wmm_grid_matches_point():
+    lon, lat = np.meshgrid(np.arange(-180, 181, 60), np.arange(-90, 91, 45))
+    mag = wmm.wmm(lat, lon, 1.5, 2025.5)
+
+    assert mag["north"].shape == lat.shape
+    assert mag["glat"].shape == (lat.shape[0],)
+    assert mag["glon"].shape == (lon.shape[1],)
+    for i in range(lat.shape[0]):
+        for j in range(lat.shape[1]):
+            pt = wmm.wmm_point(lat[i, j], lon[i, j], 1.5, 2025.5)
+            for key in ("north", "east", "down", "total", "incl", "decl"):
+                assert mag[key][i, j] == approx(pt[key])
+
+
+def test_wmm_grid_rejects_bad_layout():
+    lon, lat = np.meshgrid(np.arange(0, 30, 10), np.arange(0, 30, 10))
+    with pytest.raises(ValueError):
+        wmm.wmm(lat.T, lon, 0.0, 2025.0)
+    with pytest.raises(ValueError):
+        wmm.wmm(lat, lon[:2], 0.0, 2025.0)
+
+
+def test_transect_scalar_matches_point():
+    tr = wmm.transect(43, 93, 65, 2025.0)
+    pt = wmm.wmm_point(43, 93, 65, 2025.0)
+
+    assert isinstance(tr["north"], float)
+    for key in ("north", "east", "down", "total", "incl", "decl"):
+        assert tr[key] == approx(pt[key])
+
+
+def test_transect_broadcasts_constants():
+    lats = np.linspace(-60, 60, 7)
+    tr = wmm.transect(lats, 10.0, 0.0, np.linspace(2025.0, 2029.0, 7))
+
+    assert tr["decl"].shape == lats.shape
+    for i, lat in enumerate(lats):
+        pt = wmm.wmm_point(lat, 10.0, 0.0, 2025.0 + i * 4.0 / 6)
+        assert tr["decl"][i] == approx(pt["decl"])
+        assert tr["total"][i] == approx(pt["total"])
+
+
+def test_transect_rejects_mismatched_shapes():
+    with pytest.raises(ValueError):
+        wmm.transect(np.zeros(3), np.zeros(4), 0.0, 2025.0)
+
+
+def test_transect_empty():
+    tr = wmm.transect(np.array([]), 0.0, 0.0, 2025.0)
+    assert tr["north"].shape == (0,)

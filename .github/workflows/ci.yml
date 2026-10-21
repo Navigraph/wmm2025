@@ -7,19 +7,27 @@ on:
   push:
     paths:
     - "**.py"
+    - "**.c"
+    - "**.h"
     - "**.cmake"
     - "**/CMakeLists.txt"
+    - "**/WMM.COF"
+    - setup.cfg
+    - pyproject.toml
     - .github/workflows/ci.yml
 
 jobs:
 
   linux:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.9', '3.x']
     steps:
     - uses: actions/checkout@v6
     - uses: actions/setup-python@v6
       with:
-        python-version: '3.x'
+        python-version: ${{ matrix.python-version }}
 
     - run: pip install .[tests,lint]
 
